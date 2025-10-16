@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Manifest Gallery Viewer</title>
+  <meta name="description" content="Render images and prompts from manifest.json" />
+  <style>
+    :root {
+      --bg: #0b0c0f;
+      --card: #11141a;
+      --muted: #9aa4b2;
+      --text: #e6edf3;
+      --accent: #3b82f6;
+      --border: #1f2937;
+    }
+    html, body { margin:0; padding:0; background:var(--bg); color:var(--text); font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"; }
+    header {
+      position: sticky; top: 0; z-index: 10;
+      backdrop-filter: blur(8px);
+      background: linear-gradient(180deg, rgba(11,12,15,.95), rgba(11,12,15,.75));
+      border-bottom: 1px solid var(--border);
+    }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 12px 16px; }
+    h1 { margin: 0 0 8px; font-size: 18px; font-weight: 700; letter-spacing:.2px; }
+    .toolbar { display:grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items:center; }
+    .toolbar .left { display:flex; gap:8px; align-items:center; }
+    input[type="search"] {
+      width: 100%; padding: 10px 12px; border-radius: 10px; background: var(--card);
+      border:1px solid var(--border); color: var(--text); outline: none;
+    }
+    select, button {
+      padding: 10px 12px; border-radius: 10px; background: var(--card);
+      border:1px solid var(--border); color: var(--text); cursor:pointer;
+    }
+    .count { color: var(--muted); font-size: 12px; }
+    .grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 12px; padding: 16px;
+      max-width: 1400px; margin: 0 auto;
+    }
+    .card {
+      background: var(--card); border:1px solid var(--border);
+      border-radius: 14px; overflow: hidden; display:flex; flex-direction:column;
+      transition: transform .15s ease;
+    }
+    .card:hover { transform: translateY(-2px); }
+    .thumb {
+      aspect-ratio: 4/3; display:block; width:100%; object-fit:cover; background:#0a0c10; border-bottom:1px solid var(--border);
+    }
+    .meta { padding: 10px 12px; display:flex; flex-direction:column; gap:8px; }
+    .prompt { display:flex; flex-direction:column; gap:6px; }
+    .prompt pre {
+      white-space: pre-wrap; word-break: break-word; margin:0;
+      font-size: 13px; line-height: 1.45;
+    }
+    .short.clamped {
+      max-height: 8.5em; overflow: hidden; position: relative;
+    }
+    .short.clamped::after {
+      content:""; position:absolute; left:0; right:0; bottom:0; height:3em;
+      background: linear-gradient(to bottom, rgba(17,20,26,0), var(--card));
+    }
+    .idline { display:flex; gap:8px; flex-wrap:wrap; align-items:center; color:var(--muted); font-size:12px; }
+    .tag { border:1px solid var(--border); padding:2px 6px; border-radius: 999px; }
+    .row { display:flex; gap:8px; align-items:center; justify-content:space-between; }
+    .copy { font-size: 12px; border:1px solid var(--border); background:#0c1118; }
+    .danger { color:#fca5a5; }
+    footer { color:var(--muted); text-align:center; padding: 24px; }
+    .hidden { display:none !important; }
+    a { color: var(--accent); text-decoration: none; }
+    .help { color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>Manifest Gallery Viewer</h1>
+      <div class="toolbar">
+        <div class="left">
+          <input id="q" type="search" placeholder="搜索：prompt / id / benchmark / model / tag" />
+        </div>
+        <select id="sort">
+          <option value="default">排序：默认(原始顺序)</option>
+          <option value="iter_desc">排序：iter(降序)</option>
+          <option value="iter_asc">排序：iter(升序)</option>
+          <option value="count_desc">排序：count(降序)</option>
+          <option value="count_asc">排序：count(升序)</option>
+        </select>
+        <div class="count"><span id="shown">0</span> / <span id="total">0</span></div>
+      </div>
+      <div class="wrap help">将本页与 <code>manifest.json</code> 放到同一目录；确保 <code>manifest.items[*].image</code> 指向的路径在站点中可访问（通常是 <code>images/...</code>）。</div>
+    </div>
+  </header>
+
+  <main id="app">
+    <div id="error" class="wrap danger hidden">无法加载 manifest.json。请确认文件位于与本页面同一目录，且内容为合法 JSON。</div>
+    <section id="grid" class="grid"></section>
+    <div id="sentinel" class="wrap" style="height: 24px;"></div>
+  </main>
+
+  <footer>
+    由 manifest.json 驱动的纯静态相册 · 可部署到 Netlify / Cloudflare Pages / GitHub Pages
+  </footer>
+
+<script>
+;(() => {
+  const state = {
+    all: [],        // 原始 items
+    view: [],       // 过滤 + 排序后的索引数组（索引指向 all）
+    batchSize: 120, // 每批渲染数量
+    rendered: 0,    // 已渲染数量
+  };
+
+  const $q = document.getElementById('q');
+  const $sort = document.getElementById('sort');
+  const $grid = document.getElementById('grid');
+  const $err = document.getElementById('error');
+  const $shown = document.getElementById('shown');
+  const $total = document.getElementById('total');
+  const $sentinel = document.getElementById('sentinel');
+
+  // ================== Prompt提取与清洗 ==================
+  function fromBlocks(arr) {
+    // 兼容 [{"type":"text","value":...}] 或 [{text:...}] 或字符串数组
+    const out = [];
+    for (const el of arr) {
+      if (el == null) continue;
+      if (typeof el === 'string') { out.push(el); continue; }
+      if (typeof el === 'object') {
+        if (typeof el.value === 'string') out.push(el.value);
+        else if (typeof el.text === 'string') out.push(el.text);
+        else if (typeof el.content === 'string') out.push(el.content);
+      }
+    }
+    return out.join('\n');
+  }
+
+  function normalizePromptField(p) {
+    if (!p) return '';
+    if (typeof p === 'string') return p;
+    if (Array.isArray(p)) return fromBlocks(p);
+    if (typeof p === 'object') {
+      // OpenAI-style messages
+      if (Array.isArray(p.messages)) {
+        const parts = [];
+        for (const m of p.messages) {
+          if (!m) continue;
+          if (typeof m.content === 'string') {
+            if (m.role === 'user' || !m.role) parts.push(m.content);
+          } else if (Array.isArray(m.content)) {
+            parts.push(fromBlocks(m.content));
+          }
+        }
+        if (parts.length) return parts.join('\n\n');
+      }
+      if (typeof p.text === 'string') return p.text;
+      if (typeof p.value === 'string') return p.value;
+      if (typeof p.prompt === 'string') return p.prompt;
+      try { return JSON.stringify(p); } catch { return String(p); }
+    }
+    return String(p ?? '');
+  }
+
+  function cleanPrompt(s) {
+    let t = String(s || '');
+
+    // 1) 去掉明显的上下文/系统段落行（this.context / context: / ### Context）
+    t = t.split('\n').filter(line => {
+      return !/^\s*(this\.context\b|context\s*:|###\s*context\b)/i.test(line);
+    }).join('\n');
+
+    // 2) 压缩多余空行
+    t = t.replace(/\n{3,}/g, '\n\n');
+
+    return t.trim();
+  }
+
+  function extractPrompt(item) {
+    const candidates = [
+      item.prompt,
+      item.caption,
+      item?.extra?.prompt,
+    ];
+    for (const c of candidates) {
+      const s = cleanPrompt(normalizePromptField(c));
+      if (s) return s;
+    }
+    return '';
+  }
+
+  // 实用：从 tags 中提取 iter 与 count 的数值（若存在）
+  function parseIterCount(tags) {
+    let iter = null, count = null;
+    if (Array.isArray(tags)) {
+      for (const t of tags) {
+        if (typeof t === 'string') {
+          if (t.startsWith('iter:')) { const v = t.slice(5); if (/^\d+$/.test(v)) iter = Number(v); }
+          if (t.startsWith('count:')) { const v = t.slice(6); if (/^\d+$/.test(v)) count = Number(v); }
+        }
+      }
+    }
+    return {iter, count};
+  }
+
+  function escapeHTML(s) { return (s==null?'':String(s)).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+  // ================== 渲染 ==================
+  function renderCard(item) {
+    const promptFull = extractPrompt(item);
+    const image = item.image || '';
+    const model = item.model || '';
+    const benchmark = item.benchmark || '';
+    const id = item.id || '';
+    const tags = Array.isArray(item.tags) ? item.tags : [];
+    const {iter, count} = parseIterCount(tags);
+
+    const article = document.createElement('article');
+    article.className = 'card';
+
+    const img = document.createElement('img');
+    img.className = 'thumb';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.src = encodeURI(image);
+    img.alt = promptFull.slice(0, 120);
+    img.onerror = () => { img.alt = '(图像无法加载)'; };
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+
+    // prompt (短/全 + toggle)
+    const promptBox = document.createElement('div');
+    promptBox.className = 'prompt';
+    const preShort = document.createElement('pre');
+    const preFull = document.createElement('pre');
+    preFull.className = 'full hidden';
+
+    // 构造短文案
+    const LIMIT = 280;
+    const needClamp = promptFull.length > LIMIT;
+    preShort.textContent = needClamp ? (promptFull.slice(0, LIMIT) + '…') : promptFull;
+    if (needClamp) preShort.classList.add('short', 'clamped'); else preShort.classList.add('short');
+    preFull.textContent = promptFull;
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'copy toggle' + (needClamp ? '' : ' hidden');
+    toggleBtn.textContent = '展开';
+
+    promptBox.appendChild(preShort);
+    promptBox.appendChild(preFull);
+    promptBox.appendChild(toggleBtn);
+
+    // tag 行 + 按钮行
+    const row = document.createElement('div');
+    row.className = 'row';
+
+    const idline = document.createElement('div');
+    idline.className = 'idline';
+    if (id) { const s = document.createElement('span'); s.className = 'tag'; s.title = 'id'; s.textContent = id; idline.appendChild(s); }
+    if (benchmark) { const s = document.createElement('span'); s.className = 'tag'; s.title = 'benchmark'; s.textContent = benchmark; idline.appendChild(s); }
+    if (model) { const s = document.createElement('span'); s.className = 'tag'; s.title = 'model'; s.textContent = model; idline.appendChild(s); }
+    if (iter!=null) { const s = document.createElement('span'); s.className = 'tag'; s.title = 'iter'; s.textContent = 'iter:'+iter; idline.appendChild(s); }
+    if (count!=null) { const s = document.createElement('span'); s.className = 'tag'; s.title = 'count'; s.textContent = 'count:'+count; idline.appendChild(s); }
+    for (const t of tags) {
+      const str = String(t);
+      if (str.startsWith('iter:') || str.startsWith('count:')) continue;
+      const s = document.createElement('span');
+      s.className = 'tag'; s.textContent = str; idline.appendChild(s);
+    }
+
+    const btns = document.createElement('div');
+    btns.className = 'row';
+    btns.style.gap = '6px';
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'copy do-copy';
+    copyBtn.textContent = '复制prompt';
+    const dl = document.createElement('a');
+    dl.className = 'copy'; dl.href = encodeURI(image); dl.download = ''; dl.textContent = '下载图';
+    btns.appendChild(copyBtn);
+    btns.appendChild(dl);
+
+    row.appendChild(idline);
+    row.appendChild(btns);
+
+    meta.appendChild(promptBox);
+    meta.appendChild(row);
+
+    article.appendChild(img);
+    article.appendChild(meta);
+
+    return article;
+  }
+
+  function setCounts() {
+    $shown.textContent = state.view.length.toString();
+    $total.textContent = state.all.length.toString();
+  }
+
+  function clearGrid() { $grid.innerHTML = ''; state.rendered = 0; }
+
+  function renderMore() {
+    const remain = state.view.length - state.rendered;
+    if (remain <= 0) return;
+    const take = Math.min(state.batchSize, remain);
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < take; i++) {
+      const idx = state.view[state.rendered + i];
+      const item = state.all[idx];
+      const card = renderCard(item);
+      frag.appendChild(card);
+    }
+    $grid.appendChild(frag);
+    state.rendered += take;
+  }
+
+  // ================== 交互：复制/展开 ==================
+  $grid.addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    const card = e.target.closest('.card');
+    if (!card) return;
+
+    if (btn.classList.contains('do-copy')) {
+      const full = card.querySelector('.prompt .full')?.textContent ?? '';
+      navigator.clipboard.writeText(full).then(() => {
+        const old = btn.textContent;
+        btn.textContent = '已复制';
+        setTimeout(()=> btn.textContent = old, 1200);
+      }).catch(()=>{});
+      return;
+    }
+
+    if (btn.classList.contains('toggle')) {
+      const preShort = card.querySelector('.prompt .short');
+      const preFull = card.querySelector('.prompt .full');
+      const expanded = !preFull.classList.contains('hidden');
+      if (expanded) {
+        preFull.classList.add('hidden');
+        preShort.classList.remove('hidden');
+        btn.textContent = '展开';
+      } else {
+        preFull.classList.remove('hidden');
+        preShort.classList.add('hidden');
+        btn.textContent = '收起';
+      }
+      return;
+    }
+  });
+
+  // ================== 过滤排序 ==================
+  function recomputeView() {
+    // 过滤
+    const q = ($q.value || '').trim().toLowerCase();
+    const match = (item) => {
+      if (!q) return true;
+      const prompt = extractPrompt(item);
+      const hay = [
+        prompt, item.id, item.benchmark, item.model,
+        ...(Array.isArray(item.tags) ? item.tags : []),
+      ].filter(Boolean).join(' ').toLowerCase();
+      return hay.includes(q);
+    };
+    let indices = [];
+    for (let i = 0; i < state.all.length; i++) if (match(state.all[i])) indices.push(i);
+
+    // 排序
+    const mode = $sort.value;
+    const keyIter = (i) => parseIterCount(state.all[i].tags).iter ?? -Infinity;
+    const keyCount = (i) => parseIterCount(state.all[i].tags).count ?? -Infinity;
+
+    if (mode === 'iter_desc') indices.sort((a,b)=> keyIter(b) - keyIter(a));
+    else if (mode === 'iter_asc') indices.sort((a,b)=> keyIter(a) - keyIter(b));
+    else if (mode === 'count_desc') indices.sort((a,b)=> keyCount(b) - keyCount(a));
+    else if (mode === 'count_asc') indices.sort((a,b)=> keyCount(a) - keyCount(b));
+    // default: 保留原始顺序
+
+    state.view = indices;
+    setCounts();
+    clearGrid();
+    renderMore();
+  }
+
+  // 监听搜索与排序
+  $q.addEventListener('input', () => { recomputeView(); });
+  $sort.addEventListener('change', () => { recomputeView(); });
+
+  // 无限滚动
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (e.isIntersecting) renderMore();
+    }
+  });
+  io.observe($sentinel);
+
+  // 载入 manifest.json
+  fetch('manifest.json', { cache: 'no-store' })
+    .then(r => { if (!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(json => {
+      const items = Array.isArray(json?.items) ? json.items : [];
+      state.all = items;
+      setCounts();
+      recomputeView();
+    })
+    .catch(err => {
+      console.error(err);
+      $err.classList.remove('hidden');
+    });
+})();
+</script>
+</body>
+</html>
